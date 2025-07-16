@@ -1,98 +1,150 @@
 import express from "express";
-import cors from "cors"; // Importar CORS
+import { initializeApp, cert } from "firebase-admin/app";
+import { getFirestore } from "firebase-admin/firestore";
+import cors from "cors";
+
+// ✅ Leer credencial desde variable de entorno
+const firebaseKey = process.env.FIREBASE_KEY;
+if (!firebaseKey) {
+  console.error("❌ ERROR: Falta la variable de entorno FIREBASE_KEY");
+  process.exit(1);
+}
+const serviceAccount = JSON.parse(firebaseKey);
+
+// ✅ Inicializa Firebase Admin
+initializeApp({
+  credential: cert(serviceAccount),
+});
+const db = getFirestore();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const port = process.env.PORT || 4000;
 
-const TOKEN = process.env.APIKEY;
-const CHAT_ID = process.env.CHATID;
-
-// Objeto para almacenar IPs y su conteo de peticiones
-const ipRequests = {};
-
-const MAX_REQUESTS = 10;
-
-// Configurar CORS para permitir peticiones desde cualquier origen
 app.use(cors());
 app.use(express.json());
 
-// Endpoint para ver las IPs y sus contadores
-app.get("/status", (req, res) => {
-  res.status(200).json(ipRequests);
+const clients = []; // Lista de conexiones SSE activas
+
+// 📡 Conexión SSE por usuario
+app.get("/events/:userId", (req, res) => {
+  const userId = req.params.userId;
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const horaActual = new Date();
+  const hora = horaActual.getHours().toString().padStart(2, "0");
+  const minutos = horaActual.getMinutes().toString().padStart(2, "0");
+
+  const client = { userId, res };
+  clients.push(client);
+
+  req.on("close", () => {
+    console.log(`❌ Cliente desconectado: ${userId} a las ${hora}:${minutos}`);
+    clients.splice(clients.indexOf(client), 1);
+  });
+
+  console.log(`🟢 Cliente conectado: ${userId} a las ${hora}:${minutos}`);
 });
 
-// Endpoint para limpiar todas las IPs
-app.delete("/reset", (req, res) => {
-  // Limpiar el objeto de las IPs
-  for (let ip in ipRequests) {
-    delete ipRequests[ip];
-  }
-  res.status(200).json({ message: "All IPs have been reset" });
+// 🔄 Escucha de cambios en Firestore
+db.collection("usuarios").onSnapshot((snapshot) => {
+  snapshot.docChanges().forEach((change) => {
+    const data = change.doc.data();
+    const docId = change.doc.id;
+
+    clients.forEach((client) => {
+      if (client.userId === docId) {
+        client.res.write(`data: ${JSON.stringify(data)}\n\n`);
+      }
+    });
+  });
 });
 
-// Endpoint para eliminar una IP específica
-app.delete("/reset/:ip", (req, res) => {
-  const { ip } = req.params;
-  if (ipRequests[ip]) {
-    delete ipRequests[ip];
-    return res.status(200).json({ message: `IP ${ip} has been reset` });
+// 📥 Crear o actualizar usuario
+app.post("/usuarios", async (req, res) => {
+  const { userId, data } = req.body;
+
+  if (!userId || !data) {
+    return res.status(400).json({ error: "Faltan parámetros" });
   }
-  res.status(404).json({ error: `IP ${ip} not found` });
+
+  await db.collection("usuarios").doc(userId).set(data, { merge: true });
+  res.status(200).json({ success: true });
 });
 
-app.post("/", async (req, res) => {
-  const { message } = req.body;
+// ❌ Eliminar todas las conexiones
+app.delete("/conexiones", (req, res) => {
+  clients.forEach((client) => {
+    client.res.end();
+  });
+  const cantidad = clients.length;
+  clients.length = 0;
+  console.log(`🧹 ${cantidad} conexiones eliminadas`);
+  res.json({ success: true, eliminados: cantidad });
+});
 
-  if (!message) {
-    return res.status(400).json({ error: "No message provided" });
+// ❌ Eliminar conexión de un usuario específico
+app.delete("/conexiones/:userId", (req, res) => {
+  const userId = req.params.userId;
+  const index = clients.findIndex((c) => c.userId === userId);
+
+  if (index !== -1) {
+    clients[index].res.end();
+    clients.splice(index, 1);
+    console.log(`🗑️ Usuario ${userId} desconectado`);
+    return res.json({ success: true, eliminado: userId });
   }
 
-  // Obtener la IP del cliente
-  const ip =
-    req.headers["x-forwarded-for"]?.split(",").shift() ||
-    req.socket.remoteAddress;
+  res.status(404).json({ error: "Usuario no encontrado" });
+});
 
-  // Inicializar contador si no existe
-  if (!ipRequests[ip]) {
-    ipRequests[ip] = 0;
+// 📋 Ver usuarios conectados
+app.get("/conexiones", (req, res) => {
+  const usuariosConectados = clients.map((client) => client.userId);
+  res.json({ total: usuariosConectados.length, usuarios: usuariosConectados });
+});
+
+// 🗑️ Eliminar usuario completo (doc + conexión)
+app.delete("/usuarios-completo/:userId", async (req, res) => {
+  const userId = req.params.userId;
+
+  const index = clients.findIndex((c) => c.userId === userId);
+  if (index !== -1) {
+    clients[index].res.end();
+    clients.splice(index, 1);
+    console.log(`🔌 SSE cerrada para ${userId}`);
   }
-
-  // Verificar si ya alcanzó el límite
-  if (ipRequests[ip] >= MAX_REQUESTS) {
-    return res.status(429).json({ error: "Request limit reached for this IP" });
-  }
-
-  // Incrementar el contador
-  ipRequests[ip]++;
-
-  const url = `https://api.telegram.org/bot${TOKEN}/sendMessage`;
-  const data = {
-    chat_id: CHAT_ID,
-    text: `<b>Mensaje recibido:</b> ${message}\n<b>IP:</b> ${ip}\n<b>Intentos:</b> ${ipRequests[ip]}/${MAX_REQUESTS}`,
-    parse_mode: "HTML",
-  };
 
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
-
-    if (!response.ok) {
-      throw new Error("Failed to send message");
-    }
-
-    res.status(200).json({
-      message: "Message sent successfully",
-      ip,
-      attempts: ipRequests[ip],
-    });
+    await db.collection("usuarios").doc(userId).delete();
+    console.log(`🗑️ Documento eliminado: ${userId}`);
+    res.json({ success: true, eliminado: userId });
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    console.error("❌ Error al eliminar:", error);
+    res.status(500).json({ error: "No se pudo eliminar el usuario" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🔥 Server is running on port ${PORT}`);
+// 🛰️ Ping para saber si está online
+app.post("/ping", async (req, res) => {
+  const { userId, timestamp } = req.body;
+
+  if (!userId || !timestamp) {
+    return res.status(400).json({ error: "Faltan datos" });
+  }
+
+  await db
+    .collection("usuarios")
+    .doc(userId)
+    .set({ lastPing: timestamp }, { merge: true });
+  res.json({ success: true });
+});
+
+app.listen(port, () => {
+  console.log(
+    `🚀 Backend en tiempo real corriendo en http://localhost:${port}`
+  );
 });
